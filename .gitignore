@@ -1,0 +1,7 @@
+/devmail
+node_modules/
+test-results/
+playwright-report/
+trace-archive/
+.env
+.zed/

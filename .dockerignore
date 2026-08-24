@@ -1,0 +1,11 @@
+.git
+docs
+tests
+node_modules
+test-results
+playwright-report
+trace-archive
+*.md
+.env
+.env.*
+!.env.example

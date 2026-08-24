@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>devmail</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; display: flex; height: 100vh; font: 14px/1.4 system-ui, sans-serif; background: #1e1e1e; color: #ddd; }
+  #sidebar { width: 320px; overflow-y: auto; border-right: 1px solid #444; display: flex; flex-direction: column; }
+  #sidebarHead { padding: 8px; border-bottom: 1px solid #444; display: flex; align-items: center; gap: 8px; }
+  #sidebarHead h2 { font-size: 13px; text-transform: uppercase; color: #888; margin: 0; flex: 1; }
+  #messageList { list-style: none; margin: 0; padding: 0; flex: 1; overflow-y: auto; }
+  #messageList li { padding: 8px; border-bottom: 1px solid #333; }
+  #messageList li:hover, #messageList li.active { background: #333; }
+  #messageList li a { color: inherit; text-decoration: none; display: block; }
+  .msg-from { color: #6ea8ff; font-size: 12px; }
+  .msg-subject { font-weight: 600; }
+  .msg-date { color: #888; font-size: 12px; }
+  #main { flex: 1; display: flex; flex-direction: column; padding: 12px; box-sizing: border-box; overflow: hidden; }
+  button { padding: 4px 12px; background: #2d6cdf; color: #fff; border: none; border-radius: 4px; cursor: pointer; font: inherit; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button:hover:not(:disabled) { filter: brightness(1.1); }
+  #detailToolbar { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+  .tab-btn.active { background: #1b4fa0; box-shadow: inset 0 0 0 2px #6ea8ff; }
+  #loadRemote[aria-pressed="true"] { background: #2a7a2a; }
+  #deleteMessage { background: #a03030; margin-left: auto; }
+  #detailSubject { font-size: 18px; font-weight: 700; }
+  #detailFrom, #detailTo { color: #aaa; font-size: 12px; }
+  #detailDate { color: #888; font-size: 12px; }
+  .date-secondary { color: #666; margin-left: 6px; }
+  #parseError { background: #4a1f1f; color: #ffb3b3; border: 1px solid #7a2f2f; padding: 8px; margin: 8px 0; border-radius: 4px; white-space: pre-wrap; }
+  #attachments { list-style: none; margin: 8px 0; padding: 0; border: 1px solid #333; border-radius: 4px; }
+  #attachments li { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-bottom: 1px solid #333; }
+  #attachments li:last-child { border-bottom: none; }
+  .att-name { font-weight: 600; }
+  .att-meta { color: #888; font-size: 12px; flex: 1; }
+  #detail { flex-direction: column; min-height: 0; }
+  #detail:not([hidden]) { display: flex; flex: 1; }
+  #bodyText, #bodyRaw { white-space: pre-wrap; overflow: auto; flex: 1; margin: 0; font-family: ui-monospace, monospace; font-size: 12px; }
+  #bodyHtml { flex: 1; border: 0; background: #fff; width: 100%; }
+  .placeholder { color: #888; padding: 24px; }
+  #status { color: #f77; min-height: 1em; }
+</style>
+</head>
+<body>
+  <div id="sidebar">
+    <div id="sidebarHead">
+      <h2>Inbox (<span id="count">0</span>)</h2>
+      <button id="clear">Clear</button>
+    </div>
+    <ul id="messageList"></ul>
+  </div>
+  <div id="main">
+    <div id="empty" class="placeholder">No messages yet.</div>
+    <div id="notFound" class="placeholder" hidden>That message is gone &mdash; it was deleted or aged out of the ring.</div>
+    <div id="authRequired" class="placeholder" hidden>This mailbox requires a token. Open it with <code>?token=&lt;your token&gt;</code>.</div>
+    <div id="detail" hidden>
+      <div id="detailSubject"></div>
+      <div id="detailFrom"></div>
+      <div id="detailTo"></div>
+      <div id="detailDate"></div>
+      <div id="detailToolbar">
+        <button id="tabText" class="tab-btn" type="button">Text</button>
+        <button id="tabHtml" class="tab-btn" type="button">HTML</button>
+        <button id="tabRaw" class="tab-btn" type="button">Raw</button>
+        <button id="loadRemote" type="button" aria-pressed="false" hidden>Load remote images</button>
+        <button id="deleteMessage" type="button">Delete</button>
+      </div>
+      <ul id="attachments" hidden></ul>
+      <div id="parseError" hidden></div>
+      <pre id="bodyText"></pre>
+      <!-- sandbox="" is STATIC and must stay that way. Setting it after the
+           document loads would render the first load unsandboxed. The body is
+           assigned via the srcdoc DOM PROPERTY, never interpolated into
+           markup: a body containing a double quote would otherwise terminate
+           the attribute and inject into this document, outside the sandbox. -->
+      <iframe id="bodyHtml" sandbox="" csp="default-src 'none'; img-src data:" hidden></iframe>
+      <pre id="bodyRaw" hidden></pre>
+    </div>
+    <div id="status"></div>
+  </div>
+
+<script>
+// Token bootstrap, list fetch, detail fetch, tab switching, attachment
+// download via blob:, the remote-images toggle, and delete are all wired up
+// below. Two module-level sequence counters (renderSeq / listSeq) guard
+// against out-of-order async responses clobbering a newer render: the list
+// polls every 2s while the user clicks around, so a stale list response must
+// never touch the detail pane, and a stale detail response must never paint
+// under a newer selection.
+const $ = (id) => document.getElementById(id)
+
+function clearChildren(el) {
+  while (el.firstChild) el.removeChild(el.firstChild)
+}
+
+function formatDate(d) {
+  const dt = new Date(d)
+  return isNaN(dt.getTime()) ? String(d) : dt.toLocaleString()
+}
+
+function humanSize(n) {
+  if (typeof n !== 'number' || isNaN(n)) return ''
+  if (n < 1024) return n + ' B'
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let v = n
+  let u = -1
+  do { v /= 1024; u++ } while (v >= 1024 && u < units.length - 1)
+  return v.toFixed(v < 10 ? 1 : 0) + ' ' + units[u]
+}
+
+function setStatus(msg) {
+  $('status').textContent = msg || ''
+}
+
+// Bootstrap the token out of the URL and into sessionStorage, then strip it
+// from the address bar so it leaves no history entry. It still appears once in
+// the access log of this first request -- documented in the README.
+const params = new URLSearchParams(location.search)
+if (params.get('token')) {
+  sessionStorage.setItem('devmail-token', params.get('token'))
+  params.delete('token')
+  history.replaceState(null, '', location.pathname + (params.toString() ? '?' + params : ''))
+}
+
+function authHeaders() {
+  const t = sessionStorage.getItem('devmail-token')
+  return t ? { Authorization: 'Bearer ' + t } : {}
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { ...opts, headers: { ...authHeaders(), ...(opts.headers || {}) } })
+  if (res.status === 401) {
+    $('authRequired').hidden = false
+    $('empty').hidden = true
+    $('detail').hidden = true
+    $('notFound').hidden = true
+    throw new Error('unauthorized')
+  }
+  $('authRequired').hidden = true
+  return res
+}
+
+function currentId() {
+  return new URLSearchParams(location.search).get('id')
+}
+
+// --- Detail-pane state -----------------------------------------------------
+let renderSeq = 0        // bumped on every showMessage() call; the invariant
+                          // is that once renderDetail() has run, renderSeq
+                          // equals the seq of the message currently on screen
+let currentMessage = null
+let currentTab = 'text'  // 'text' | 'html' | 'raw'
+let rawLoadedSeq = -1    // renderSeq value for which #bodyRaw was populated
+
+let listSeq = 0           // bumped on every loadList() call
+
+function updateActiveListItem(id) {
+  const list = $('messageList')
+  for (const li of list.children) {
+    li.classList.toggle('active', li.dataset.id === id)
+  }
+}
+
+async function loadList() {
+  const seq = ++listSeq
+  let res
+  try {
+    res = await api('/api/messages')
+  } catch (e) {
+    return
+  }
+  if (seq !== listSeq) return
+  const msgs = await res.json()
+  if (seq !== listSeq) return
+
+  setStatus('')
+  $('count').textContent = msgs.length
+  const list = $('messageList')
+  clearChildren(list)
+  const activeId = currentId()
+  for (const m of msgs) {
+    const li = document.createElement('li')
+    li.dataset.id = m.id
+    if (m.id === activeId) li.classList.add('active')
+    const a = document.createElement('a')
+    a.href = '/?id=' + encodeURIComponent(m.id)
+    const from = document.createElement('div')
+    from.className = 'msg-from'
+    from.textContent = m.from
+    const subj = document.createElement('div')
+    subj.className = 'msg-subject'
+    subj.textContent = m.subject || '(no subject)'
+    const date = document.createElement('div')
+    date.className = 'msg-date'
+    date.textContent = formatDate(m.receivedAt)
+    a.append(from, subj, date)
+    li.appendChild(a)
+    list.appendChild(li)
+  }
+  // #empty means "the mailbox is genuinely empty". It is only this
+  // function's call, and only meaningful when no message is selected --
+  // when a message IS selected, showMessage() owns whether #detail or
+  // #notFound is visible, and this list refresh must never touch that.
+  if (activeId === null) {
+    $('empty').hidden = msgs.length !== 0
+  }
+}
+
+function renderDate(m) {
+  const el = $('detailDate')
+  clearChildren(el)
+  const primary = document.createElement('span')
+  primary.textContent = formatDate(m.receivedAt)
+  el.appendChild(primary)
+  if (m.date) {
+    const received = new Date(m.receivedAt).getTime()
+    const header = new Date(m.date).getTime()
+    if (!isNaN(header) && Math.abs(header - received) > 60000) {
+      const secondary = document.createElement('span')
+      secondary.className = 'date-secondary'
+      secondary.textContent = '(Date header: ' + formatDate(m.date) + ')'
+      el.appendChild(secondary)
+    }
+  }
+}
+
+function renderParseError(m) {
+  const el = $('parseError')
+  if (m.parseError) {
+    el.textContent = 'This message failed to parse: ' + m.parseError
+    el.hidden = false
+  } else {
+    el.textContent = ''
+    el.hidden = true
+  }
+}
+
+function renderAttachments(m) {
+  const ul = $('attachments')
+  clearChildren(ul)
+  const atts = m.attachments || []
+  for (let i = 0; i < atts.length; i++) {
+    const att = atts[i]
+    const li = document.createElement('li')
+    li.dataset.index = String(i)
+    const name = document.createElement('span')
+    name.className = 'att-name'
+    name.textContent = att.filename || '(unnamed)'
+    const meta = document.createElement('span')
+    meta.className = 'att-meta'
+    meta.textContent = (att.contentType || '') + ' · ' + humanSize(att.size)
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.textContent = 'Download'
+    btn.addEventListener('click', () => downloadAttachment(m.id, i, att.filename))
+    li.append(name, meta, btn)
+    ul.appendChild(li)
+  }
+  $('attachments').hidden = atts.length === 0
+}
+
+// A plain <a href download> cannot carry the Authorization header, so
+// attachment downloads go through api() -> blob -> a temporary object URL.
+async function downloadAttachment(id, index, filename) {
+  let res
+  try {
+    res = await api('/api/messages/' + encodeURIComponent(id) + '/attachments/' + index)
+  } catch (e) {
+    return
+  }
+  if (!res.ok) return
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename || 'attachment'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+function renderActiveTab() {
+  $('tabText').classList.toggle('active', currentTab === 'text')
+  $('tabHtml').classList.toggle('active', currentTab === 'html')
+  $('tabRaw').classList.toggle('active', currentTab === 'raw')
+  $('bodyText').hidden = currentTab !== 'text'
+  $('bodyHtml').hidden = currentTab !== 'html'
+  $('bodyRaw').hidden = currentTab !== 'raw'
+}
+
+async function loadRaw(id, seq) {
+  $('bodyRaw').textContent = 'Loading…'
+  let res
+  try {
+    res = await api('/api/messages/' + encodeURIComponent(id) + '/raw')
+  } catch (e) {
+    return
+  }
+  if (seq !== renderSeq) return
+  if (!res.ok) {
+    $('bodyRaw').textContent = ''
+    return
+  }
+  const text = await res.text()
+  if (seq !== renderSeq) return
+  $('bodyRaw').textContent = text
+}
+
+function setTab(tab) {
+  if (!currentMessage) return
+  if (tab === 'html' && !currentMessage.html) return
+  currentTab = tab
+  renderActiveTab()
+  if (tab === 'raw' && rawLoadedSeq !== renderSeq) {
+    rawLoadedSeq = renderSeq
+    loadRaw(currentMessage.id, renderSeq)
+  }
+}
+
+$('tabText').onclick = () => setTab('text')
+$('tabHtml').onclick = () => setTab('html')
+$('tabRaw').onclick = () => setTab('raw')
+
+$('loadRemote').onclick = async () => {
+  if (!currentMessage || !currentMessage.html) return
+  const seq = renderSeq
+  const id = currentMessage.id
+  let res
+  try {
+    res = await api('/api/messages/' + encodeURIComponent(id) + '?remote=1')
+  } catch (e) {
+    return
+  }
+  if (seq !== renderSeq) return
+  if (!res.ok) return
+  const m = await res.json()
+  if (seq !== renderSeq) return
+  currentMessage = m
+  // Property assignment, never markup interpolation -- see the iframe note.
+  $('bodyHtml').srcdoc = m.html || ''
+  $('loadRemote').classList.add('active')
+  $('loadRemote').setAttribute('aria-pressed', 'true')
+  $('loadRemote').textContent = 'Remote images loaded'
+}
+
+$('deleteMessage').onclick = async () => {
+  if (!currentMessage) return
+  try {
+    await api('/api/messages/' + encodeURIComponent(currentMessage.id), { method: 'DELETE' })
+  } catch (e) {
+    return
+  }
+  navigate(null)
+  loadList().catch(() => {})
+}
+
+function renderDetail(m) {
+  currentMessage = m
+  currentTab = m.text ? 'text' : (m.html ? 'html' : 'text')
+  rawLoadedSeq = -1
+
+  $('notFound').hidden = true
+  $('empty').hidden = true
+  $('detail').hidden = false
+
+  $('detailSubject').textContent = m.subject || '(no subject)'
+  $('detailFrom').textContent = m.from || ''
+  $('detailTo').textContent = (m.to || []).join(', ')
+  renderDate(m)
+
+  $('tabHtml').disabled = !m.html
+  // Property assignment, never markup interpolation -- see the iframe note.
+  $('bodyHtml').srcdoc = m.html || ''
+  $('bodyText').textContent = m.text || ''
+  $('bodyRaw').textContent = ''
+
+  $('loadRemote').hidden = !m.html
+  $('loadRemote').classList.remove('active')
+  $('loadRemote').setAttribute('aria-pressed', 'false')
+  $('loadRemote').textContent = 'Load remote images'
+
+  renderParseError(m)
+  renderAttachments(m)
+  renderActiveTab()
+  updateActiveListItem(m.id)
+}
+
+async function showMessage(id) {
+  const seq = ++renderSeq
+  if (!id) {
+    currentMessage = null
+    $('detail').hidden = true
+    $('notFound').hidden = true
+    updateActiveListItem(null)
+    return
+  }
+  let res
+  try {
+    res = await api('/api/messages/' + encodeURIComponent(id))
+  } catch (e) {
+    throw e
+  }
+  if (seq !== renderSeq) return
+  if (res.status === 404) {
+    currentMessage = null
+    $('detail').hidden = true
+    $('notFound').hidden = false
+    $('empty').hidden = true
+    updateActiveListItem(null)
+    return
+  }
+  if (!res.ok) {
+    throw new Error('failed to load message: ' + res.status)
+  }
+  const m = await res.json()
+  if (seq !== renderSeq) return
+  setStatus('')
+  renderDetail(m)
+}
+
+function navigate(id) {
+  const url = id ? '/?id=' + encodeURIComponent(id) : '/'
+  if (url !== location.pathname + location.search) history.pushState(null, '', url)
+  showMessage(id).catch((e) => setStatus(e.message))
+  loadList().catch(() => {})
+}
+
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a[href^="/?id="]')
+  if (!a) return
+  if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+  e.preventDefault()
+  navigate(new URL(a.href).searchParams.get('id'))
+})
+
+window.addEventListener('popstate', () => {
+  showMessage(currentId()).catch((e) => setStatus(e.message))
+  loadList().catch(() => {})
+})
+
+$('clear').onclick = async () => {
+  try {
+    await api('/api/messages', { method: 'DELETE' })
+  } catch (e) {
+    return
+  }
+  navigate(null)
+}
+
+loadList().then(() => showMessage(currentId())).catch((e) => setStatus(e.message))
+setInterval(() => loadList().catch(() => {}), 2000)
+</script>
+</body>
+</html>

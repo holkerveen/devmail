@@ -33,7 +33,12 @@ func main() {
 	to := env("TO", "recipient@example.test")
 	subject := env("SUBJECT", "devmail fixture "+time.Now().UTC().Format(time.RFC3339))
 
-	if user == "" || pass == "" {
+	// AUTH=none skips authentication entirely so the e2e suite can prove the
+	// server refuses unauthenticated mail. Any other value authenticates
+	// normally; pass a wrong SMTP_PASSWORD to exercise the rejection path.
+	authMode := env("AUTH", "plain")
+
+	if authMode != "none" && (user == "" || pass == "") {
 		log.Fatal("send: SMTP_USER and SMTP_PASSWORD are required")
 	}
 
@@ -64,9 +69,11 @@ func main() {
 	}
 	defer client.Close()
 
-	auth := smtp.PlainAuth("", user, pass, host)
-	if err := client.Auth(auth); err != nil {
-		log.Fatalf("send: auth: %v", err)
+	if authMode != "none" {
+		auth := smtp.PlainAuth("", user, pass, host)
+		if err := client.Auth(auth); err != nil {
+			log.Fatalf("send: auth: %v", err)
+		}
 	}
 
 	if err := client.Mail(from); err != nil {

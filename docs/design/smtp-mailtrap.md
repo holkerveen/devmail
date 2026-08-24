@@ -1,4 +1,4 @@
-Status: Phase 5 — fan-out implementation (skeleton committed and verified end to end)
+Status: Complete — implemented, unit tests and e2e green on both the dev and prod stacks, CI wired.
 
 ## Brief
 

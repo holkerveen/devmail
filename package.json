@@ -2,6 +2,7 @@
   "name": "devmail",
   "private": true,
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "SMTPS mailtrap with a web UI, for local dev and e2e testing. Node exists in this repo only to drive Playwright; the shipped image is Go-only.",
   "type": "module",
   "scripts": {

@@ -1,4 +1,4 @@
-Status: Phase 3 — question loop (all 3 roasts merged and verified)
+Status: Phase 3 — awaiting review gate. All open questions resolved; Design/Interfaces/Work breakdown updated to match.
 
 ## Brief
 
@@ -59,177 +59,254 @@ Read from the module cache, not from docs:
 
 ## Design
 
-A single static Go binary in an Alpine image. It listens on two ports: **SMTPS** (implicit TLS, authenticated, accepts and stores mail, never relays) and **HTTP** (the mailbox UI + JSON API). Messages live in a bounded in-memory ring buffer and are lost on restart — this is a dev tool, not a mail store.
+A single static Go binary in an Alpine image. Two listeners: **SMTPS** (implicit TLS, authentication mandatory, accepts and stores mail, never relays) and **HTTP** (mailbox UI + JSON API). Messages are held as **raw bytes only** in a bounded in-memory ring and are lost on restart — this is a dev tool, not a mail store.
 
 ### Process layout
 
 ```
-main.go              config from env, build store, start SMTP + HTTP, signal shutdown
-config.go            env parsing + validation (fails fast at boot)
-store.go             Message type, in-memory ring buffer, subscriber fan-out
-smtp.go              go-smtp Backend/Session: auth gate, size cap, parse, store
-tlscert.go           load cert from env paths, else generate a self-signed one
-web.go               JSON API handlers + embedded UI
+main.go              config, store, TLS, both listeners, signal shutdown, GOMEMLIMIT
+config.go            env parsing + validation (fails fast at boot), redacting String()
+store.go             Message, ring bounded by BOTH count and total bytes
+smtp.go              go-smtp Backend/Session: auth gate, Reset contract, size cap, store
+sasllogin.go         dual-entry AUTH LOGIN sasl.Server (go-sasl has no server side)
+parse.go             lazy MIME parse: raw bytes -> ParsedMessage
+tlscert.go           load cert from env paths, else generate ephemeral self-signed
+web.go               JSON API, bearer-token middleware, embedded UI
 public/index.html    the whole frontend (go:embed)
 ```
 
-Flat `package main` at the repo root, mirroring dbadmin's flat `src/`. No `internal/` tree — the whole thing is ~800 lines.
+Flat `package main` at the repo root, mirroring dbadmin's flat `src/`. No `internal/` tree.
 
 ### SMTP
 
-- **Implicit TLS only.** `smtp.Server.ListenAndServeTLS()`. `AllowInsecureAuth = false`. STARTTLS is structurally unreachable (see verified facts). There is no cleartext SMTP listener at all.
-- **Auth is mandatory and enforced by our `Session`.** `Session.Mail()`, `Rcpt()` and `Data()` each return `smtp.ErrAuthRequired` unless `s.authed` is true. go-smtp will not do this for us.
-- **Mechanisms:** `PLAIN` and `LOGIN`. PLAIN via `sasl.NewPlainServer`; LOGIN via a small in-repo `sasl.Server` implementation, because go-sasl ships no LOGIN server. Both compare with `crypto/subtle.ConstantTimeCompare`.
-- **Every recipient is accepted.** `Rcpt()` never rejects on address — the point is to swallow all mail regardless of domain.
-- **Nothing is ever relayed.** There is no outbound SMTP client anywhere in the binary.
-- **Size cap:** `smtp.Server.MaxMessageBytes` = `DEVMAIL_MAX_MESSAGE_BYTES` (default 10 MiB). Also `MaxRecipients` (default 100) and `ReadTimeout`/`WriteTimeout` (default 30 s) so a stuck client cannot pin a goroutine forever.
+- **Implicit TLS only** — `smtp.Server.ListenAndServeTLS()`. `AllowInsecureAuth = false`. There is no cleartext listener, so STARTTLS is structurally unreachable (`conn.go:259-260`).
+- **Auth is enforced by our `Session`, not by go-smtp.** `Mail()`, `Rcpt()` and `Data()` each return `smtp.ErrAuthRequired` unless `s.authed`. go-smtp's `handleMail` has no `didAuth` check (V-verified).
+- **`Reset()` contract (V11):** clears `from`, `to`, and per-message state; **preserves `authed`**. go-smtp calls it after *every* message (`conn.go:979`→`1347`), on `RSET`, and on a repeated `EHLO`, while `NewSession` runs once per connection. Getting this wrong either drops every message after the first on a pooled connection, or leaks message N-1's recipients into message N.
+- **Auth failure returns a fixed 535** (`*smtp.SMTPError{Code:535, EnhancedCode:{5,7,8}, Message:"Authentication credentials invalid"}`), never go-smtp's default 454, which mailers read as "retry later" and loop on forever. The authenticator's own error text is logged server-side and **never** written to the wire (V1).
+- **Mechanisms:** `PLAIN` (via `sasl.NewPlainServer`) and `LOGIN` (in-repo, `sasllogin.go`). The LOGIN server is **dual-entry** (V13): if `Next` is first called with a non-nil response, that response *is* the username; if nil, it emits `Username:` first. The password challenge must be byte-exactly `Password:` or go-sasl's own client rejects it. Both compare with `crypto/subtle.ConstantTimeCompare`.
+- **Failed-auth attempts are counted per connection** and the connection is dropped after 3. go-smtp routes auth failures through `writeError`, not `protocolError`, so its own `errCount` never increments — unlimited guesses otherwise (V13).
+- **Every recipient is accepted.** `Rcpt()` never rejects on address; swallowing all mail is the point.
+- **Nothing is ever relayed.** No outbound SMTP client exists in the binary.
+- **Explicit limits:** `MaxMessageBytes`, `MaxRecipients`, `MaxLineLength` (**must be set explicitly — the 2000 default silently destroys any message with a long base64 or DKIM line, handing `Data()` zero bytes**, V2), `ReadTimeout`, `WriteTimeout`.
+- **Read errors reject; parse errors store** (V12). `ErrDataTooLarge` hands `Data()` a complete-looking truncated prefix alongside the error — that prefix is discarded and the client gets 552. Only *parsing* problems produce a stored message with `ParseError` set.
 
 ### Storage
 
-`store.Store` is a mutex-guarded slice used as a ring: appending past `DEVMAIL_MAX_MESSAGES` (default 200) drops the oldest. Ids are a monotonically increasing counter rendered as a decimal string, so ordering is total and ids are never reused within a process lifetime.
+`Store` is a mutex-guarded `[]*Message` ring bounded by **both** `MaxMessages` and `MaxTotalBytes`; `Add` evicts oldest until both hold. `[]*Message` (not `[]Message`) so eviction concurrent with a reader is safe rather than tearing.
 
-A `Message` is parsed **once, at receive time** — envelope, headers, text part, HTML part, attachment metadata — and the raw bytes are kept alongside so `/raw` and re-parsing stay possible. Parsing failures are not dropped: the message is stored with `ParseError` set and the raw body still viewable, because a mailtrap that hides malformed mail is useless for debugging exactly the case you care about.
+A stored `Message` holds **only** `{ID, ReceivedAt, From, To, Size, Subject, Raw}`. `Subject` is lifted at receive by a header-only scan (cheap, and it is the one field the list must show). Everything else — text, HTML, attachments, full headers — is parsed **on demand** in `GET /api/messages/{id}`.
+
+**Ids are opaque random strings**, not a counter (V16): decimal-string ids sort lexicographically wrong at ten messages, and a per-process counter makes `/?id=5` point at unrelated mail after any restart.
+
+**Insertion order under the store mutex is the total order.** Nothing sorts by `ReceivedAt` — that would reintroduce a tie. The list is labelled with `receivedAt` (arrival), not the sender's `Date:` header; the header `Date` appears only in the detail pane (V17).
+
+Order matters for eviction vs. auth: a message is added to the store only after `Data()` has fully succeeded, and the client is ACKed 250 only after `Add` returns.
 
 ### HTTP API
 
 ```
-GET    /healthz              -> 200 {"status":"ok"}
-GET    /api/messages         -> [{id, from, to[], subject, date, size, hasHTML, hasAttachments}]  newest first
-GET    /api/messages/{id}    -> {id, from, to[], subject, date, size, headers{}, text, html, attachments[{filename,contentType,size}], parseError}
-GET    /api/messages/{id}/raw-> text/plain, the RFC 5322 bytes as received
-DELETE /api/messages/{id}    -> 204
-DELETE /api/messages         -> 204, clears the mailbox
-GET    /api/events           -> text/event-stream, one event per new message (see Open questions)
+GET    /healthz                              -> 200 {"status":"ok","version":"..."}   NO TOKEN
+GET    /                                     -> the UI shell                          NO TOKEN
+GET    /api/messages                         -> [{id, receivedAt, from, to[], subject, size}]  newest first
+GET    /api/messages/{id}                    -> parsed detail (see Interfaces)
+GET    /api/messages/{id}/raw                -> text/plain, bytes as received
+GET    /api/messages/{id}/attachments/{n}    -> the attachment bytes
+DELETE /api/messages/{id}                    -> 204, or 404 if unknown
+DELETE /api/messages                         -> 204, clears the mailbox
 ```
 
-`net/http` with Go 1.22+ pattern routing (`GET /api/messages/{id}`). No router dependency.
+`net/http` with Go 1.22 pattern routing. No router dependency. The list refreshes by **polling** (`setInterval`, 2s); there is no SSE, so `Store` carries no subscribers and cannot be wedged by a suspended browser tab.
+
+**`/healthz` reports SMTP liveness, not just HTTP** (V5). `main` records successful SMTP bind in an atomic; `/healthz` returns 503 until it is set, and either listener exiting is fatal to the process. Otherwise a devmail with a dead SMTP port stays green and the whole test harness — Docker `HEALTHCHECK`, compose `service_healthy`, `devmail.sh`'s poll — starts against it anyway.
+
+### HTTP authentication
+
+`DEVMAIL_HTTP_TOKEN`, **unset by default** (open, like dbadmin, with the same loud README warning). When set:
+
+- `/api/*` requires `Authorization: Bearer <token>`, compared with `crypto/subtle.ConstantTimeCompare`. 401 otherwise.
+- `/` and `/healthz` are always exempt — the shell carries no data, and gating `/healthz` breaks k8s probes and the Docker `HEALTHCHECK`.
+- The browser bootstraps from `?token=…`: the page stores it in `sessionStorage` and immediately `history.replaceState`s it out of the URL, so it leaves no history entry. It still appears once in the server access log of that first request — stated in the README.
+- **Every browser sub-resource goes through `fetch()` with the header.** An `<iframe src>` or `<a href download>` cannot send `Authorization`, so the HTML body rides inside the detail JSON, and an attachment download is `fetch` → `blob:` URL → `<a href>`. This is why there is no `/html` sub-resource endpoint.
+- `#authRequired` is shown when `/api/*` answers 401, instead of a blank pane.
 
 ### Frontend
 
-One embedded `public/index.html`: vanilla JS, dark theme, two panes — message list on the left, selected message on the right — following dbadmin's visual language and its "URL is the state" rule. `?id=<id>` selects a message; the list items are real `<a href="/?id=…">` and one delegated click handler pushes state. Back/Forward work.
+One embedded `public/index.html`: vanilla JS, dark theme, two panes — list left, message right — following dbadmin's visual language and its "URL is the state" rule. `?id=<id>` selects a message; list rows are real `<a href="/?id=…">` behind one delegated click handler with modifier-key guards. Back/Forward work.
 
-**HTML bodies render inside `<iframe sandbox="" srcdoc="…">`.** A trapped email is attacker-controlled input; rendering its HTML into the mailbox document would let any mail sent to the trap run script in the mailbox origin. `sandbox=""` with no allow-tokens blocks scripts, forms, top-level navigation and same-origin access. A Text / HTML / Raw tab strip selects the view.
+A **`renderSeq` guard** (ported from `dbadmin/src/public/index.html:49-51`) covers the click × auto-refresh race, and **the list refresh never touches the detail pane** (V20). When `?id=` names a message that was evicted or deleted, `#notFound` is shown — a distinct state from `#empty`.
 
-The list refreshes as mail arrives (mechanism = open question: SSE vs polling).
+**HTML bodies render in `<iframe sandbox="" srcdoc="…">`**, where:
+- The iframe carries `sandbox=""` **in the static HTML**, and the body is assigned via the **DOM property** (`el.srcdoc = html`), never string-interpolated into markup. Building it as markup lets a body containing `"` break out of the attribute into the mailbox document, outside the sandbox (V19).
+- **Remote subresources are stripped server-side by default** — `sandbox=""` does not block image loads, so a tracking pixel would fire on click and leak "opened" plus the developer's IP, from a tool whose premise is that it sends nothing. Stripping is the primary control because the iframe `csp=` attribute is Chrome-only; `csp="default-src 'none'; img-src data:"` is set as well, belt-and-braces.
+- A per-message **"Load remote images"** toggle re-fetches with `?remote=1` and renders unstripped, for when you genuinely need to check a template.
 
 ### TLS certificate
 
-1. If `DEVMAIL_TLS_CERT` and `DEVMAIL_TLS_KEY` are set, load that pair; a failure is fatal at boot.
-2. Otherwise generate a self-signed P-256 certificate **in memory at startup**, valid for `DEVMAIL_TLS_HOSTS` (default `localhost,devmail,127.0.0.1`), and log its SHA-256 fingerprint.
+1. `DEVMAIL_TLS_CERT` + `DEVMAIL_TLS_KEY` set → load that pair; failure is fatal at boot.
+2. Otherwise generate an **ephemeral** self-signed P-256 cert at startup for `DEVMAIL_TLS_HOSTS`, and log the SHA-256 fingerprint **labelled as ephemeral** so nobody pins it.
 
-The self-signed default means consuming apps must disable certificate verification (`rejectUnauthorized: false`, `verify_peer: false`, `TLS_SKIP_VERIFY`, …). That is normal for a dev mailtrap and is called out loudly in the README. The cert is regenerated on every restart, so anything that pinned it breaks — see Open questions.
+Consuming apps must disable verification (`rejectUnauthorized:false`, `verify_peer:false`, …). **A wildcard SAN cannot cover the k8s service FQDN** — `*.svc.cluster.local` matches exactly one label, so it does not match `devmail.myns.svc.cluster.local`. The default is therefore `localhost,127.0.0.1,::1,devmail`, and the README instructs operators to set `DEVMAIL_TLS_HOSTS=devmail.myns.svc.cluster.local,devmail.myns,devmail` for their namespace. JVM/JavaMail clients, which cannot skip verification, must mount a stable cert via `DEVMAIL_TLS_CERT`.
+
+### Logging
+
+One structured line per event, because five distinct failures otherwise all present as "empty mailbox, zero output": accepted (remote addr, from, rcpt count, bytes, id), auth-failed, rejected-oversize, rejected-long-line, parse-error, evicted. go-smtp's own `ErrorLog` covers none of these — `handleConn` returns `nil` for EOF, `ErrTooLongLine` and idle timeout alike (`server.go:232-244`).
+
+### Shutdown
+
+`signal.NotifyContext` → stop accepting, `http.Server.Shutdown(ctx)` and `smtp.Server.Shutdown(ctx)` with a bounded context, then **`smtp.Server.Close()` on expiry** — go-smtp's `Shutdown` waits on a WaitGroup and never closes idle connections, and unlike `http.Server` it has no fallback, so a pooled idle connection blocks SIGTERM until `ReadTimeout` (V3). The README sets `terminationGracePeriodSeconds` above `ReadTimeout`.
 
 ### Configuration
-
-All via env, all with defaults except the credentials:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `DEVMAIL_SMTP_PORT` | `465` | SMTPS listen port |
 | `DEVMAIL_SMTP_USER` | — **required** | AUTH username |
 | `DEVMAIL_SMTP_PASSWORD` | — **required** | AUTH password |
-| `DEVMAIL_SMTP_DOMAIN` | `devmail` | greeting banner name |
+| `DEVMAIL_SMTP_PASSWORD_FILE` | empty | read the password from a mounted Secret instead |
+| `DEVMAIL_SMTP_DOMAIN` | `devmail` | greeting banner |
 | `DEVMAIL_HTTP_PORT` | `80` | mailbox UI + API |
-| `DEVMAIL_MAX_MESSAGES` | `200` | ring buffer size |
-| `DEVMAIL_MAX_MESSAGE_BYTES` | `10485760` | per-message cap |
+| `DEVMAIL_HTTP_TOKEN` | empty | empty = no HTTP auth; set = Bearer required on `/api/*` |
+| `DEVMAIL_MAX_MESSAGES` | `100` | ring bound by count |
+| `DEVMAIL_MAX_TOTAL_BYTES` | `16777216` | ring bound by total raw bytes (16 MiB) |
+| `DEVMAIL_MAX_MESSAGE_BYTES` | `2097152` | per-message cap (2 MiB) |
+| `DEVMAIL_MAX_LINE_BYTES` | `1048576` | **must be set explicitly**; go-smtp's 2000 default eats real mail |
 | `DEVMAIL_MAX_RECIPIENTS` | `100` | per-message RCPT cap |
-| `DEVMAIL_TLS_CERT` / `DEVMAIL_TLS_KEY` | empty | PEM paths; empty = self-signed |
-| `DEVMAIL_TLS_HOSTS` | `localhost,devmail,127.0.0.1` | SANs for the generated cert |
+| `DEVMAIL_READ_TIMEOUT` / `DEVMAIL_WRITE_TIMEOUT` | `60s` | armed per readLine, so it governs the whole DATA body (V21) |
+| `DEVMAIL_TLS_CERT` / `DEVMAIL_TLS_KEY` | empty | PEM paths; empty = ephemeral self-signed |
+| `DEVMAIL_TLS_HOSTS` | `localhost,127.0.0.1,::1,devmail` | SANs; set per namespace in k8s |
 
-**Boot fails loudly** if `DEVMAIL_SMTP_USER` or `DEVMAIL_SMTP_PASSWORD` is empty. A mailtrap that silently accepts anonymous mail because an env var was misspelled is the exact failure the brief is trying to prevent.
+**Boot fails loudly** if user or password is empty. `Config` implements a redacting `String()`/`GoString()` so no future `%+v` can leak the password into logs (V7-adjacent).
+
+`GOMEMLIMIT` is set from `MaxTotalBytes` × a headroom factor at startup, so Go's GC targets a bound consistent with the ring rather than the default `GOGC=100` doubling.
 
 ### Image
 
 ```
-FROM golang:1.24-alpine AS build   # CGO_ENABLED=0, -trimpath, -ldflags="-s -w"
+FROM golang:1.24-alpine AS build   # CGO_ENABLED=0, -trimpath, -ldflags="-s -w -X main.version=..."
 FROM golang:1.24-alpine AS dev     # source mounted, `go run .`
-FROM alpine:3.21       AS prod     # ca-certificates, nonroot user, the binary, nothing else
+FROM alpine:3.21       AS prod     # nonroot user, the binary, nothing else
 ```
 
-Budget: `alpine:3.21` ≈ 8.3 MB + a static binary with go-smtp/go-message ≈ 9–11 MB → **≈ 18–20 MB**, inside the 25 MB ceiling. `./devmail.sh size` prints the built prod image size and exits non-zero above 25 MB, so the budget is enforced rather than hoped for.
+No `ca-certificates` — there is no outbound TLS client in the binary, so the CA bundle would never be read. Measured (both roasts independently): `alpine:3.21` 7.83 MB + binary ~5.6 MB (with `go-message/charset`) → **≈14 MB uncompressed, ≈6 MB compressed**, against a 25 MB ceiling. `./devmail.sh size` asserts the **uncompressed `docker image inspect .Size`** figure, stated explicitly because compressed and uncompressed differ by ~2.2× and the doc was previously ambiguous.
+
+`_ "github.com/emersion/go-message/charset"` is blank-imported. Without it, latin-1 bodies land in a Go string as raw bytes and `encoding/json` silently replaces them with U+FFFD **returning no error**, while subjects decode fine — mojibake bodies with no diagnostic (V15). Measured cost 0.86 MB against ~11 MB of headroom.
 
 ## Interfaces
 
 ```go
 // config.go
 type Config struct {
-    SMTPPort, HTTPPort           int
-    SMTPUser, SMTPPassword       string
-    SMTPDomain                   string
-    MaxMessages, MaxRecipients   int
-    MaxMessageBytes              int64
-    TLSCertFile, TLSKeyFile      string
-    TLSHosts                     []string
+    SMTPPort, HTTPPort              int
+    SMTPUser, SMTPPassword          string
+    SMTPDomain                      string
+    HTTPToken                       string
+    MaxMessages, MaxRecipients      int
+    MaxTotalBytes, MaxMessageBytes  int64
+    MaxLineBytes                    int
+    ReadTimeout, WriteTimeout       time.Duration
+    TLSCertFile, TLSKeyFile         string
+    TLSHosts                        []string
 }
-func Load() (*Config, error)   // reads os.Getenv, validates, never panics
+func Load() (*Config, error)
+func (c *Config) String() string   // redacts SMTPPassword and HTTPToken
 
-// store.go
-type Attachment struct {
-    Filename    string `json:"filename"`
-    ContentType string `json:"contentType"`
-    Size        int    `json:"size"`
-}
+// store.go  -- stored form: raw bytes only
 type Message struct {
-    ID          string            `json:"id"`
-    ReceivedAt  time.Time         `json:"receivedAt"`
-    From        string            `json:"from"`        // envelope MAIL FROM
-    To          []string          `json:"to"`          // envelope RCPT TO
-    Subject     string            `json:"subject"`
-    Date        string            `json:"date"`
-    Size        int               `json:"size"`
-    Headers     map[string]string `json:"headers,omitempty"`
-    Text        string            `json:"text,omitempty"`
-    HTML        string            `json:"html,omitempty"`
-    Attachments []Attachment      `json:"attachments,omitempty"`
-    ParseError  string            `json:"parseError,omitempty"`
-    Raw         []byte            `json:"-"`
+    ID         string    `json:"id"`
+    ReceivedAt time.Time `json:"receivedAt"`
+    From       string    `json:"from"`      // envelope MAIL FROM
+    To         []string  `json:"to"`        // envelope RCPT TO
+    Subject    string    `json:"subject"`   // header-only scan at receive
+    Size       int       `json:"size"`
+    Raw        []byte    `json:"-"`
 }
-type Store struct { /* mu, msgs []*Message, nextID uint64, max int, subs … */ }
-func NewStore(max int) *Store
-func (s *Store) Add(m *Message)            // assigns ID, evicts oldest past max
-func (s *Store) List() []*Message          // newest first, without Raw/Headers/bodies
+type Store struct{ /* mu, msgs []*Message, bytes int64, maxMsgs int, maxBytes int64 */ }
+func NewStore(maxMsgs int, maxBytes int64) *Store
+func (s *Store) Add(m *Message)          // assigns opaque random ID; evicts until BOTH bounds hold
+func (s *Store) List() []Message         // VALUES, newest first, Raw nil -- never leaks pointers
 func (s *Store) Get(id string) (*Message, bool)
 func (s *Store) Delete(id string) bool
 func (s *Store) Clear()
 
+// parse.go  -- on demand, never at receive
+type Attachment struct {
+    Filename    string `json:"filename"`     // "attachment-N" when the part names none
+    ContentType string `json:"contentType"`
+    Size        int    `json:"size"`
+}
+type ParsedMessage struct {
+    Message
+    Headers     map[string][]string `json:"headers"`   // []string: a message has many Received:
+    Date        *time.Time          `json:"date,omitempty"`
+    Text        string              `json:"text,omitempty"`
+    HTML        string              `json:"html,omitempty"`
+    Attachments []Attachment        `json:"attachments,omitempty"`
+    ParseError  string              `json:"parseError,omitempty"`
+}
+// Parse MUST NOT dereference the Reader when CreateReader returns nil (V10):
+//   mr, err := mail.CreateReader(bytes.NewReader(raw))
+//   if mr == nil { return ParsedMessage{Message: m, ParseError: err.Error()}, nil }
+// Part classification is by CONTENT-TYPE, not by go-message's Inline/Attachment
+// header type (V14): only text/plain -> Text, only text/html -> HTML, everything
+// else -> Attachments regardless of disposition. An inline cid: PNG is an
+// attachment, not body text.
+func Parse(m *Message, stripRemote bool) ParsedMessage
+func ParseAttachment(m *Message, n int) (Attachment, []byte, error)
+
 // smtp.go
-func NewSMTPServer(cfg *Config, st *Store, tlsCfg *tls.Config) *smtp.Server
+func NewSMTPServer(cfg *Config, st *Store, tlsCfg *tls.Config, log *slog.Logger) *smtp.Server
+
+// sasllogin.go
+func NewLoginServer(auth func(user, pass string) error) sasl.Server   // dual-entry, see V13
 
 // tlscert.go
-func TLSConfig(cfg *Config) (*tls.Config, error)
+func TLSConfig(cfg *Config, log *slog.Logger) (*tls.Config, error)
 
 // web.go
-func NewHandler(st *Store) http.Handler
+func NewHandler(cfg *Config, st *Store, smtpReady *atomic.Bool, log *slog.Logger) http.Handler
 ```
+
+Attachment downloads are served `Content-Type: application/octet-stream`, `X-Content-Type-Options: nosniff`, and `Content-Disposition: attachment; filename="…"` with the filename sanitized and quoted — **never** the email's declared Content-Type, which would make a `text/html` attachment stored XSS on the mailbox origin.
 
 DOM contract the specs and helpers may rely on:
 
-| id | element |
+| id / selector | element |
 |---|---|
-| `#messageList` | `<ul>`; items `li[data-id]` containing `a[href^="/?id="]` |
-| `#messageList li.active` | the selected item |
-| `.msg-from`, `.msg-subject`, `.msg-date` | fields inside a list item |
-| `#detail` | right pane wrapper |
-| `#detailSubject`, `#detailFrom`, `#detailTo` | header fields |
-| `#tabText`, `#tabHtml`, `#tabRaw` | the tab buttons |
-| `#bodyText` | `<pre>` for the plain-text part |
-| `#bodyHtml` | the sandboxed `<iframe>` |
-| `#empty` | the "no messages" placeholder |
-| `#clear` | clear-mailbox button |
+| `#messageList` | `<ul>`; rows `li[data-id]` containing `a[href^="/?id="]` |
+| `#messageList li.active` | the selected row |
+| `.msg-from`, `.msg-subject`, `.msg-date` | fields within a row (`.msg-date` renders `receivedAt`) |
 | `#count` | message count |
+| `#detail` | right pane wrapper |
+| `#detailSubject`, `#detailFrom`, `#detailTo`, `#detailDate` | header fields |
+| `#tabText`, `#tabHtml`, `#tabRaw` | tab buttons |
+| `#bodyText` | `<pre>` for the plain-text part |
+| `#bodyHtml` | the `<iframe sandbox="">`, static in the HTML |
+| `#loadRemote` | "Load remote images" toggle |
+| `#attachments` | `<ul>`; rows `li[data-index]` with a download link |
+| `#deleteMessage` | per-message delete button |
+| `#clear` | clear-mailbox button |
+| `#empty` | "no messages" placeholder |
+| `#notFound` | "that message is gone" placeholder (evicted or deleted) |
+| `#authRequired` | shown when `/api/*` returns 401 |
 
 ## Work breakdown
 
-1. **Config + store** — `config.go`, `store.go`, `config_test.go`, `store_test.go`. Depends on: nothing.
-2. **SMTP server** — `smtp.go`, `tlscert.go`, `smtp_test.go`. Depends on: 1.
-3. **Web API + UI** — `web.go`, `public/index.html`, `web_test.go`. Depends on: 1.
-4. **Container + entrypoint** — `Dockerfile`, `docker-compose*.yml`, `devmail.sh`, `.env.example`, `.dockerignore`, `.gitignore`. Depends on: 1–3 for the port/env names only (fixed by the skeleton).
-5. **E2E + CI + docs** — `tests/e2e/**`, `tests/seed/main.go`, `tests/fixtures/messages.json`, `.github/workflows/ci.yml`, `README.md`, `docs/releasing.md`. Depends on: 1–4.
+1. **Config + store** — `config.go`, `store.go`, `config_test.go`, `store_test.go`. Dual-bound ring, opaque ids, redacting `String()`. Depends on: nothing.
+2. **SMTP server + auth** — `smtp.go`, `sasllogin.go`, `tlscert.go`, `smtp_test.go`, `sasllogin_test.go`. Auth gate, `Reset()` contract, 535, dual-entry LOGIN, failed-attempt counter, explicit limits. Depends on: 1. **Escalated to opus** — it is the security boundary and a protocol state machine.
+3. **Parsing** — `parse.go`, `parse_test.go`. Lazy parse, nil-Reader guard, Content-Type classification, remote stripping. Depends on: 1.
+4. **Web API + UI** — `web.go`, `public/index.html`, `web_test.go`. Bearer middleware, routes, SMTP-aware `/healthz`, the two-pane UI, `renderSeq`, srcdoc property assignment. Depends on: 1, 3.
+5. **Container + entrypoint** — `Dockerfile`, `docker-compose*.yml`, `devmail.sh`, `.env.example`, `.dockerignore`, `.gitignore`, `package.json`. Depends on: 1-4 for env/port names only (fixed by the skeleton).
+6. **E2E + CI + docs** — `tests/e2e/**`, `tests/fixtures.json`, `.github/workflows/ci.yml`, `README.md`, `docs/releasing.md`. Depends on: 1-5.
 
 ## E2E acceptance
 
-1. **Authenticated SMTPS delivery shows up in the mailbox.** A client connects to the SMTPS port over implicit TLS, authenticates with the configured credentials, and sends a multipart message. The browser shows it in `#messageList` with the right sender and subject; clicking it renders the text body in `#bodyText` and the HTML part in the sandboxed iframe.
-2. **Unauthenticated and wrong-password delivery is refused, and the mailbox stays empty.** A client that connects over TLS and issues `MAIL FROM` without authenticating gets a 502/530-class rejection; a client that authenticates with a wrong password gets a 535. Neither message appears in `#messageList`.
+Browser specs (Playwright) prove what only a browser can; Go tests prove the protocol.
+
+1. **Authenticated SMTPS delivery renders in the mailbox.** `./devmail.sh send` delivers a multipart fixture over implicit TLS with valid credentials. The browser shows the row in `#messageList` with the expected sender and subject; clicking it fills `#detailSubject`/`#detailFrom`, renders the plain part in `#bodyText`, and the HTML tab sets `#bodyHtml`'s `srcdoc` **attribute** while `sandbox` is present and empty.
+   *Asserting the attribute, not the frame's contents:* `sandbox=""` grants no `allow-scripts`, and Playwright's `frameLocator()` runs its selector engine inside the target frame — so a `frameLocator` assertion would likely time out. The attribute assertion is also what catches the srcdoc-escaping defect (V19). **This behaviour must be confirmed against a real Playwright run before the spec is finalised** — it is reasoned, not yet observed.
+2. **Rejected mail never reaches the mailbox, proven with a positive barrier.** Send (a) with no AUTH, (b) with a wrong password, then (c) one *authenticated* message. Assert `#count` is exactly **1** and the single row is (c). Asserting only "the list is empty" after (a) and (b) is vacuous — it passes on a build with no auth gate at all, because the assertion can run before any delivery would have appeared (V18).
+
+Go tests additionally cover, none of which a browser can reach cleanly: **two messages on one connection** (the `Reset()`/`authed` contract, invisible to any test opening a fresh connection per message), a **header-less malformed message** (stored with `ParseError`, not a 421 that kills the connection), a **line over 2000 bytes** (must be accepted, proving `MaxLineLength` was set), wrong-password returning **535 not 454**, and AUTH LOGIN driven by go-sasl's own client (proving the dual-entry state machine).
 
 ## Open questions
 
@@ -249,41 +326,7 @@ Merged from the ops/security and simplicity roasts. **Verified by me against sou
 
 ### Questions for the user
 
-1. **Mailbox HTTP auth.** Ops roast rates this CRITICAL and I agree: the brief put auth on the *write* path (SMTP) and left the *read* path — which holds every password-reset link and magic token — fully open. In a flat k8s namespace any pod can `GET /api/messages`, harvest a reset token it triggered itself, then `DELETE` the evidence. dbadmin's "no auth, warn loudly" precedent does not transfer: dbadmin's blast radius is one dev database, devmail's is any account reachable by the app under test. Options: (a) optional `DEVMAIL_HTTP_TOKEN`, off by default; (b) required token; (c) no auth + README warning, matching dbadmin. Note adding auth later is a breaking change for scripted consumers.
-2. **Memory bound.** Defaults of 200 messages x 10 MiB, keeping raw *and* parsed, measured at **4 GiB live heap / 8 GiB GC target** at `GOGC=100`. A pod with a sane 512Mi limit gets OOMKilled — SIGKILL, so no shutdown path runs, the whole mailbox evaporates, and it restarts into a green `/healthz`. Anyone who can authenticate can trigger it deterministically. Options: lower defaults, store raw only (lazy parse), set `GOMEMLIMIT`, or a total-bytes cap instead of a message count.
-3. **Lazy parse / store raw only.** Simplicity roast: deleting eager parse removes `Text`, `HTML`, `Attachments`, `ParseError`, `Headers` from the stored struct, halves memory, and resolves V4. Parse on `GET /api/messages/{id}` instead. (Parsing in the *browser* was considered and rejected — 150+ lines of hand-rolled JS MIME.)
-4. **Scope cuts with no consumer in the design:** `DELETE /api/messages/{id}` + `Store.Delete`, the `Attachment` type + `hasAttachments`, `hasHTML`. Cut or keep?
-5. **SSE vs polling.** SSE is strictly additive — the ring evicts and has no `Last-Event-ID` replay, so the client needs the full-refetch path regardless; polling needs only that path. SSE is also the sole reason `Store` carries `subs`, and fan-out under the mutex is a real wedge risk (a suspended laptop tab blocks `Add`, deadlocking SMTP). dbadmin has no push machinery.
-6. **Self-signed cert regenerated per restart**, and default SANs (`localhost,devmail,127.0.0.1`) omit `devmail.<ns>.svc.cluster.local`. JVM/JavaMail clients cannot "just disable verification" — they need a truststore import, which breaks on every restart. Option: persist the generated pair to `DEVMAIL_TLS_DIR` and reuse.
-7. **Credentials as plain env vars** are printed by `kubectl describe pod`, `docker inspect`, and any `%+v` of `Config`. Add `DEVMAIL_SMTP_PASSWORD_FILE` + a redacting `String()`?
-8. **Ids are a per-process counter**, so after a restart `/?id=5` points at unrelated mail. Random/time-prefixed ids cost nothing now and cannot be changed later.
-9. **`?id=` URL-state machinery**: dbadmin's justification was durable, shareable state. devmail's ids evict at 200 and die on restart, so bookmarking is impossible by construction — it buys only in-session Back. Keep as house style, or drop for a plain click handler?
-10. **Test scope.** Only E2E criterion #1 genuinely needs a browser (the `iframe sandbox srcdoc` render path). Criterion #2's browser half asserts *that nothing rendered*, which also passes if the UI is entirely broken — it was proven as a 0.21s Go test with no container. Is ~150 MB of Chromium in `setup` and every CI run earned for one assertion?
-11. **`devmail.sh` vocabulary:** `seed`/`reset`/`down --volumes` are Postgres-volume verbs with no meaning here. Drop them?
-12. **Logging.** The design specifies none, and go-smtp's `ErrorLog` fires for neither auth failures, size rejections, long lines, nor EOF. Five distinct failures (wrong password, no auth, oversize, long line, ring eviction) all present as "empty mailbox, zero server output".
-13. **k8s single-instance constraint** is unstated: `replicas: 2` or the default `RollingUpdate` (maxSurge 1) splits mail across pods and the UI flickers between "3 messages" and "empty".
-
-### Verified defects from the correctness roast (also not questions — these must change)
-
-- **V10. `mail.CreateReader` returns a NIL Reader for any non-charset error.** `mail/reader.go:64-70` — only unknown-charset errors return a usable Reader alongside the error. A header-less body (`hello world\r\n`) returns `(nil, err)`, so the natural `if err != nil { m.ParseError = ... }` followed by `mr.Header.Subject()` **nil-derefs**. go-smtp recovers the panic (`conn.go:93-101`) but kills the connection with a *retryable* 421 and the message is lost — the exact case the "malformed mail is still stored" policy exists for, triggered by the first thing anyone printfs at a mailtrap. Rule: `ParseError` is set from raw bytes without a Reader; only a non-nil Reader may be dereferenced.
-- **V11. `Session.Reset()` fires after every message, and `NewSession` runs once per connection.** `conn.go:979` (`defer c.reset()`) → `conn.go:1347`; also on `RSET` (`conn.go:134`) and on a repeated `EHLO` (`conn.go:233`). Two opposite bugs: clearing `authed` in `Reset()` rejects the **second and later messages on a pooled connection** (Nodemailer `pool:true`, Symfony, Laravel queue workers) — "the first mail arrives, the rest vanish"; not clearing the envelope makes message 2 display message 1's recipients, because go-smtp resets its own `c.recipients` but not our accumulator. Contract: `Reset()` clears from/to/per-message state and **preserves `authed`**. Needs a unit test for two messages on one connection — nothing in the current breakdown exercises connection reuse.
-- **V12. `MaxMessageBytes` is off by one and a truncated prefix can be stored and ACKed.** `data.go:71-74` returns `ErrDataTooLarge` once `n<=0`, *before* the terminating dot — so the real limit is `MaxMessageBytes-1`, while `conn.go:286` advertises `SIZE 10485760` and `conn.go:360` accepts `SIZE=10485760`. Worse, `Data()` gets a complete-looking N-byte prefix *together with* the error; applying "store parse failures anyway" here stores silent truncation and, if `Data()` returns nil, ACKs 250. Rule: **read errors reject (552, store nothing); parse errors store with `ParseError`.** Verified fine: the session stays in sync afterwards (`conn.go:989-990` drains).
-- **V13. The hand-rolled LOGIN server must be dual-entry.** `go-sasl/login.go:17-20` — `loginClient.Start()` sends the username as the **initial response**, and `login.go:24` requires the server challenge to be byte-exactly `Password:`. A naive "challenge `Username:` first" state machine fails against go-sasl's own client with `sasl: unexpected server challenge`. Both forms occur in the wild. Also: a failed AUTH goes through `writeError`, not `protocolError`, so `errCount` never increments — **unlimited password guesses on one connection**.
-- **V14. `mail.Reader` files inline non-text parts as BODY, not attachment.** `mail/reader.go:104`: `disp == "inline" || (disp != "attachment" && text/*)` → `InlineHeader`. Every Symfony/Laravel mail with an embedded `cid:` logo hits this: a classifier written as "inline ⇒ HTML or Text" dumps raw PNG bytes into `Message.Text`. Rule: classify on **Content-Type** — only `text/plain`→Text, only `text/html`→HTML, everything else→Attachments regardless of disposition. Also: an attachment with no filename yields `""` (needs a placeholder), and a corrupt base64 part errors at `io.ReadAll(p.Body)`, not at `CreateReader`.
-- **V15. Non-UTF-8 bodies are silently corrupted to U+FFFD.** `charset.go:35,50` — `CharsetReader` is a nil package global unless `go-message/charset` is blank-imported; without it the raw latin-1 bytes land in `Message.Text`, and `encoding/json` replaces them with U+FFFD and returns **no error**. Subjects are unaffected (`mime.WordDecoder` handles latin-1 natively), so subjects look right while bodies are mojibake — hard to diagnose. **Resolved without asking: import it.** Measured cost 0.85-0.86 MB against ~11 MB of headroom.
-- **V16. Ids sort lexicographically, not numerically.** `["1","2","9","10","11","100"]` sorts to `[1 10 100 11 2 9]`. Any JS sort or map iteration over decimal-string ids breaks at ten messages. Combined with V-ids-across-restarts: use an opaque random/time-prefixed id and keep insertion order (under the store mutex) as the total order. Do not sort by `ReceivedAt` — that reintroduces a tie; insertion order is already total.
-- **V17. `Date string` beside `ReceivedAt time.Time` is two clocks.** `mail/header.go:255` gives `Date() (time.Time, error)`. The list is ordered by arrival but labelled with the *sender's* `Date:` header, so a queue worker draining a backlog reads as out of order. `Date:` is absent or unparseable in exactly the messages a mailtrap sees most. And the documented list payload has **no `receivedAt` field at all**, contradicting `Message.ReceivedAt`. Sort and label by `ReceivedAt`; show the header `Date` only in the detail pane.
-- **V18. E2E criterion 2 is vacuous and criterion 1 is likely unprovable as written.** Criterion 2 asserts a negative against an asynchronously-refreshed list with no barrier — it passes even on a build with **no auth gate at all**. It needs a positive barrier: after the two rejected attempts, send one *authenticated* message and assert `#count` is exactly 1. Criterion 1 says "renders the HTML part in the sandboxed iframe", but `sandbox=""` grants no `allow-scripts` and Playwright's `frameLocator()` runs its selector engine *inside* the frame — so it likely times out. Assert the `#bodyHtml` element's `srcdoc` **attribute** plus `sandbox=""` instead, which also catches V19. *(Playwright behaviour here is reasoned, not run — the global no-concurrent-Playwright rule applied. Verify before writing the spec.)*
-- **V19. `srcdoc` escaping and remote subresources.** Building the iframe as markup lets a body containing `"` break out of the attribute into the *mailbox* document, outside the sandbox: `"></iframe><img src=x onerror="fetch('/api/messages')...">`. Safe form: the iframe carries `sandbox=""` in the **static** HTML and the body is assigned via the DOM property. Order matters — set `.srcdoc` before `.sandbox` and the document loads unsandboxed. Separately, `sandbox=""` does **not** block subresource loads, so a tracking pixel fires on click — see question 14.
-- **V20. Auto-refresh races the click.** dbadmin needed a `renderSeq` guard for manual navigation alone (`src/public/index.html:49-51`); devmail adds an automatic refresh on the same path. A stale list response repaints `#messageList`, dropping `li.active` and possibly re-issuing a detail fetch that paints message 41's body under message 42's headers. Port the guard; the list refresh must never touch the detail pane. Also undefined: what `?id=5` means once evicted or deleted (the DOM contract has `#empty` but nothing for "that message is gone"), and whether `DELETE` of a missing id is 204 or 404.
-- **V21. `ReadTimeout` governs the whole DATA body.** It is armed per-`readLine` (`conn.go:1323`), so the deadline set when `DATA` is read covers the entire transfer: 30 s for 10 MiB demands a sustained ~350 KB/s, and blowing it drops the message with 554 then kills the connection with 421.
-
-### Verified non-issues (checked, no action)
-
-- STARTTLS really is unreachable on an implicit-TLS listener (`conn.go:259-260, 920-923`).
-- 500-deep multipart nesting neither panics nor blows the stack — `mail/reader.go:83-98` uses an explicit list, not recursion.
-- Ring eviction concurrent with a reader is safe **given `msgs []*Message`**; a `[]Message` ring overwritten in place would tear.
-- `smtp.ErrAuthFailed` is 535 and `ErrAuthRequired` is 502 (`backend.go:10,15`).
+All resolved — see `## Decisions`.
 
 ### Roast claims logged but NOT yet verified by me
 
@@ -294,8 +337,30 @@ Merged from the ops/security and simplicity roasts. **Verified by me against sou
 
 ## Decisions
 
+Append-only. Question -> answer -> consequence.
+
+1. **Mailbox HTTP auth?** -> **Optional `DEVMAIL_HTTP_TOKEN`, unset by default.** Unset behaves exactly like dbadmin (open, loud README warning); set requires `Authorization: Bearer` on `/api/*`. *Consequence:* the hook ships in v1, so turning auth on later is not a breaking change for scripted consumers. `/` and `/healthz` stay exempt — gating `/healthz` would break the k8s probe and the Docker `HEALTHCHECK`.
+2. **Memory model?** -> **Store raw bytes only; parse on demand.** *Consequence:* `Text`/`HTML`/`Attachments`/`ParseError`/`Headers` leave the stored struct entirely, which also dissolves the `List()`-DTO defect (V4) — `List()` now returns *values* with `Raw` nil and cannot leak pointers into the store. `Subject` is still lifted at receive by a header-only scan, because the list must show it. `GET /api/messages/{id}` re-parses on every request; acceptable for a dev tool at a 2 MiB cap.
+3. **Test strategy?** -> **Playwright for the UI + Go tests for the protocol.** *Consequence:* `package.json` enters the repo, which **kills the VERSION-file plan** (V7) — `assert-version` reads `package.json` exactly as dbadmin's does. `./devmail.sh setup` gains npm install + `npx playwright install --with-deps chromium`, and CI gains `setup-node`. The specs are not ESLint-ed; `./devmail.sh check` covers Go only (`gofmt -l`, `go vet`, `go test`), and there is **no separate `typecheck`** because `go vet` subsumes `go build` (V9, verified).
+4. **Scope cuts?** -> **SSE cut, replaced by 2s polling. Attachments, per-message DELETE and `?id=` URL state all kept.** *Consequence:* `Store` carries no subscribers, so the fan-out-under-mutex deadlock is unreachable by construction and a suspended browser tab cannot wedge SMTP. Keeping `?id=` requires the `renderSeq` guard and a `#notFound` state (V20); keeping per-message DELETE requires a UI affordance (`#deleteMessage`) and a defined 404.
+5. **Attachments vs lazy parse (follow-up to 2 and 4)?** -> **Detail view only, plus a real download endpoint.** *Consequence:* `hasAttachments`/`hasHTML` leave the list payload — they were the only thing forcing an eager MIME walk, so decisions 2 and 4 stop conflicting. `GET /api/messages/{id}/attachments/{n}` is served `application/octet-stream` + `nosniff` + a sanitized quoted filename, **never** the email's declared Content-Type, which would make a `text/html` attachment stored XSS on the mailbox origin.
+6. **Token carrier (follow-up to 1)?** -> **Bearer on `/api/*`; the page itself open; `?token=` bootstraps into `sessionStorage` and is stripped via `replaceState`.** *Consequence:* an `<iframe src>` and an `<a href download>` cannot send `Authorization`, so **every browser sub-resource must go through `fetch()`** — the HTML body rides inside the detail JSON rather than getting its own URL, and attachment downloads are `fetch` → `blob:` → `<a href>`. The token still appears once in the access log of the bootstrap request; stated in the README.
+7. **TLS cert lifetime?** -> **Ephemeral, regenerated per restart; SANs widened.** *Consequence, and it corrects the premise of the answer:* **a wildcard SAN cannot cover the k8s service FQDN** — `*.svc.cluster.local` matches exactly one label, so it never matches `devmail.myns.svc.cluster.local`. "Widen" is therefore a sane default (`localhost,127.0.0.1,::1,devmail`) plus a documented per-namespace `DEVMAIL_TLS_HOSTS`. JVM/JavaMail clients, which cannot disable verification, must mount a stable cert via `DEVMAIL_TLS_CERT`. The logged fingerprint is labelled ephemeral so nobody pins it.
+8. **Remote content in the HTML view?** -> **Blocked by default, with a per-message "Load remote images" toggle.** *Consequence, correcting the mechanism:* the iframe `csp=` attribute is **Chrome-only**, so it cannot be the primary control — remote `src`/`href`/`url()` are **stripped server-side** during parse (`?remote=1` renders unstripped), with `csp=` set as belt-and-braces.
+9. **Memory budget?** -> **16 MiB total / 100 messages / 2 MiB per message.** Chosen with the "wrong default if your app sends invoices" caveat visible. *Consequence not on the card:* base64 inflates attachments ~33%, so the effective attachment ceiling is **~1.5 MB** — a larger PDF is rejected with 552. One env var (`DEVMAIL_MAX_MESSAGE_BYTES`) raises it. `GOMEMLIMIT` is derived from `MaxTotalBytes` so the GC targets a consistent bound.
+10. **`devmail.sh` vocabulary?** -> **Drop `seed`/`reset`/`down --volumes`; add `send`.** *Consequence:* `send` fires a fixture message at the running dev stack over authenticated SMTPS and doubles as the e2e seeder, so specs and the manual smoke test cannot drift. Final surface: `setup, dev, down, send, test:dev, test:prod, test, check, size`.
+11. **Resolved without asking — `go-message/charset` is blank-imported.** The two roasts disagreed; the correctness evidence was decisive. Without it, latin-1 bodies reach a Go string as raw bytes and `encoding/json` replaces them with U+FFFD **returning no error**, while subjects decode correctly — mojibake bodies with no diagnostic (V15). Measured cost 0.86 MB against ~11 MB of headroom.
+12. **Resolved without asking — ids are opaque random strings.** Decimal-string ids sort lexicographically wrong at ten messages (`["1","2","10"]` → `[1 10 2]`), and a per-process counter makes a bookmarked `/?id=5` point at unrelated mail after any restart. Insertion order under the store mutex is the total order; nothing sorts by `ReceivedAt`, which would reintroduce a tie.
+13. **Resolved without asking — no `ca-certificates` in the prod image.** There is no outbound TLS client in the binary, so the CA bundle would never be read. `./devmail.sh size` asserts the **uncompressed** `docker image inspect .Size`, stated explicitly because compressed and uncompressed differ by ~2.2×.
+
 ## Risks
 
-- In-memory only: a container restart loses every trapped message.
-- The self-signed certificate changes on every restart.
-- Rendering attacker-controlled HTML is the main security surface; `sandbox=""` is the whole mitigation.
+- **In-memory only.** A container restart — including an OOMKill — loses every trapped message. Nothing warns the user that this happened; the mailbox simply comes back empty.
+- **Single instance is a hard constraint, and nothing enforces it.** `replicas: 2` behind a Service, or the default `RollingUpdate` with `maxSurge: 1` even at `replicas: 1`, splits mail across pods: SMTP lands on A while the browser's poll round-robins to B, so the mailbox flickers between "3 messages" and "empty". Reads exactly like a bug in the app under test. The manifest must specify `replicas: 1` + `strategy: Recreate`, and the README must say why.
+- **The 2 MiB per-message default rejects ordinary invoice mail** (see Decision 9). The failure is a 552 at DATA plus a log line — visible, but only if someone reads the logs.
+- **`ReadTimeout` governs the entire DATA body**, not just one line (V21), because it is armed per-`readLine`. 60 s for 2 MiB is ample, but raising `MaxMessageBytes` without raising `ReadTimeout` reintroduces the cliff.
+- **The credentials are still plain env vars by default.** `DEVMAIL_SMTP_PASSWORD_FILE` and the redacting `String()` mitigate the log and `%+v` paths, but `kubectl describe pod` still prints anything passed via `env:`.
+- **The HTML view is the main attack surface**, and `sandbox=""` plus server-side stripping is the whole mitigation. A stripping bug is a same-origin script execution in the mailbox.
+- **Playwright's behaviour against `sandbox=""` is reasoned, not observed** (V18). If `frameLocator()` turns out to work, criterion 1's assertion can be strengthened; if the attribute assertion turns out to be unstable, the spec needs rework. Confirm on the first real run.
+- **`./devmail.sh size` guards a constraint already won** — measured ~14 MB against a 25 MB ceiling. It will not fire. The constraint that actually needs a gate is memory, which is now bounded by `MaxTotalBytes` + `GOMEMLIMIT` rather than by the size check.
+- **Ephemeral certs break anything that pins**, on every restart, by design (Decision 7).

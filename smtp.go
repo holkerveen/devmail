@@ -75,16 +75,25 @@ func (b *backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	if addr := c.Conn().RemoteAddr(); addr != nil {
 		remote = addr.String()
 	}
-	return &session{be: b, remote: remote}, nil
+	// The Conn is retained solely so check() can hang up on a client that
+	// keeps guessing: go-smtp offers no other way to terminate a connection
+	// from inside a SASL callback.
+	return &session{be: b, conn: c, remote: remote}, nil
 }
 
 type session struct {
 	be     *backend
+	conn   *smtp.Conn
 	remote string
 
 	// authed persists for the lifetime of the CONNECTION. See Reset.
 	authed       bool
 	authAttempts int
+
+	// locked is set once the attempt limit is hit. It closes the window
+	// between scheduling the hang-up and the socket actually closing, during
+	// which a fast client could otherwise still be guessing.
+	locked bool
 
 	// Per-message state, cleared by Reset.
 	from string
@@ -111,6 +120,9 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 // check compares in constant time and returns only errAuthFailed, never a
 // reason. The reason goes to the log.
 func (s *session) check(username, password string) error {
+	if s.locked {
+		return errAuthFailed
+	}
 	s.authAttempts++
 	userOK := subtle.ConstantTimeCompare([]byte(username), []byte(s.be.cfg.SMTPUser)) == 1
 	passOK := subtle.ConstantTimeCompare([]byte(password), []byte(s.be.cfg.SMTPPassword)) == 1
@@ -122,11 +134,28 @@ func (s *session) check(username, password string) error {
 	s.be.log.Warn("smtp: authentication failed",
 		"remote", s.remote, "user", username, "attempt", s.authAttempts)
 	if s.authAttempts >= maxAuthAttempts {
-		return &smtp.SMTPError{
-			Code:         535,
-			EnhancedCode: smtp.EnhancedCode{5, 7, 8},
-			Message:      "Too many authentication failures",
+		// Returning an error is not enough to stop a guesser: go-smtp routes
+		// auth failures through writeError rather than protocolError, so its
+		// own errCount never increments and the client keeps its connection.
+		// We have to hang up ourselves.
+		//
+		// The final rejection is written straight to the socket before the
+		// close, because go-smtp writes its response only AFTER this callback
+		// returns -- closing here first would truncate our own rejection into
+		// a bare EOF, which tells whoever is on the other end nothing. Writing
+		// directly is safe at exactly this point: the previous response was
+		// already flushed and go-smtp has nothing buffered until we return.
+		// Its subsequent write to the closed socket fails harmlessly.
+		s.locked = true
+		s.be.log.Warn("smtp: dropping connection after repeated auth failures",
+			"remote", s.remote, "attempts", s.authAttempts)
+		if c := s.conn; c != nil {
+			if raw := c.Conn(); raw != nil {
+				_, _ = io.WriteString(raw, "535 5.7.8 Too many authentication failures\r\n")
+			}
+			_ = c.Close()
 		}
+		return errAuthFailed
 	}
 	return errAuthFailed
 }
